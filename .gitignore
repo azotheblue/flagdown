@@ -22,3 +22,6 @@ categories.yaml
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local smoke-test content
+_smoke_test/

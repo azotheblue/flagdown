@@ -299,7 +299,15 @@ class CTFdClient:
         return resp.json().get("data", {})
 
     def delete_challenge(self, challenge_id: int) -> None:
-        """Delete a single challenge."""
+        """Delete a single challenge.
+
+        Clears prerequisite requirements first — CTFd often 500s on delete
+        when challenges still reference each other via requirements.
+        """
+        try:
+            self.set_challenge_requirements(challenge_id, [])
+        except requests.RequestException:
+            pass
         resp = self.session.delete(self._api_url(f"/challenges/{challenge_id}"))
         resp.raise_for_status()
 
@@ -309,16 +317,27 @@ class CTFdClient:
         Returns (deleted_count, error_count)."""
         self._challenges_cache = None
         challenges = self.get_challenges(use_cache=False)
-        deleted = 0
-        errors = 0
-
+        targets = []
         for ch in challenges:
             challenge_id = ch.get("id")
-            name = ch.get("name", "")
             if not challenge_id:
                 continue
             if category_filter and category_filter.lower() not in ch.get("category", "").lower():
                 continue
+            targets.append(ch)
+
+        # Drop prerequisites before deleting — CTFd often 500s otherwise.
+        for ch in targets:
+            try:
+                self.set_challenge_requirements(ch["id"], [])
+            except requests.RequestException:
+                pass
+
+        deleted = 0
+        errors = 0
+        for ch in targets:
+            challenge_id = ch["id"]
+            name = ch.get("name", "")
             try:
                 self.delete_challenge(challenge_id)
                 print(f"  [DELETED] {name} (id={challenge_id})")
@@ -799,7 +818,7 @@ def parse_challenge_md(
     Supports both '## Section' and '# Section' formats.
     Intro (0) questions often use ## Scenario/Overview instead of ## Question.
     """
-    content = file_path.read_text(encoding="utf-8")
+    content = file_path.read_text(encoding="utf-8-sig")  # utf-8-sig strips BOM
 
     is_intro = _is_intro_question(file_path)
     # Prefer explicit section markers. Solution subsections (## Step 1, etc.) must not
@@ -957,7 +976,7 @@ def parse_manual_challenge(file_path: Path, category: str) -> Optional[Challenge
     Parse a manual verification challenge markdown file.
     These challenges have no flag - admin reviews submissions manually.
     """
-    content = file_path.read_text(encoding="utf-8")
+    content = file_path.read_text(encoding="utf-8-sig")
 
     # Detect header format (## or #)
     has_double_hash = bool(re.search(r"^## ", content, re.MULTILINE))
@@ -1018,7 +1037,7 @@ def parse_knowledge_table(file_path: Path, category: str) -> list[Challenge]:
     Parse a knowledge table markdown file.
     Format: | Name | Description | Points | Answers | Correct Answer | How |
     """
-    content = file_path.read_text(encoding="utf-8")
+    content = file_path.read_text(encoding="utf-8-sig")
     challenges = []
 
     # Find table rows
