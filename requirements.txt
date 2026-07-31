@@ -1,0 +1,9 @@
+# Flagdown — install the package instead
+#   pip install -e .
+#   flagdown --help
+#
+# Kept for convenience / older docs:
+requests>=2.28.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+click>=8.0

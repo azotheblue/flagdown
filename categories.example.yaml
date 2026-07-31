@@ -1,0 +1,42 @@
+# Flagdown category map
+#
+# Copy to categories.yaml (or pass --config).
+# Each key is a folder under your content root (--path).
+#
+# Fields:
+#   name          CTFd category name (default: folder key)
+#   type          standard | multiple_choice | manual
+#                   multiple_choice / manual need paid CTFd plugins
+#   max_attempts  optional default for non-intro challenges in this category
+#   layout        auto | flat | nested (default: auto)
+#                   auto   -> flat for MC/manual, nested for standard
+#                   flat   -> *.md files directly in the folder
+#                   nested -> questions/*.md, *-question.md, and root *.md
+
+categories:
+  # Stock CTFd — numbered prefixes help the track-nav UI jump bar
+  01-intro:
+    type: standard
+
+  02-web:
+    name: Web
+    type: standard
+
+  03-forensics:
+    name: Forensics
+    type: standard
+    max_attempts: 3
+
+  04-network:
+    name: Network
+    type: standard
+
+  # Optional — requires CTFd Multiple Choice (paid plugin)
+  05-quiz:
+    name: Quiz
+    type: multiple_choice
+
+  # Optional — requires CTFd Manual Verification (paid plugin)
+  06-writeups:
+    name: Writeups
+    type: manual
