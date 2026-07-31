@@ -154,6 +154,13 @@ flagdown ui track-nav           # sticky category bar → Theme Footer
 flagdown ui sort-by-name        # natural name order → core-beta Settings Editor
 ```
 
+## Contributors
+
+- [azotheblue](https://github.com/azotheblue) — project lead
+- [Cursor](https://cursor.com) (CLI / agentic coding) — pair-programmer on the extract, packaging, docs, and tooling
+
+Built with heavy agentic engineering. Humans still own the bugs.
+
 ## License
 
 [MIT](LICENSE)
