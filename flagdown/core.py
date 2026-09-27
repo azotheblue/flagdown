@@ -20,6 +20,7 @@ import os
 import re
 import json
 import argparse
+import hashlib
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -35,6 +36,10 @@ CTFD_TOKEN = os.getenv("CTFD_TOKEN", "")
 
 VALID_CATEGORY_TYPES = frozenset({"standard", "multiple_choice", "manual"})
 VALID_LAYOUTS = frozenset({"auto", "flat", "nested"})
+PLUGIN_TYPE_HELP = {
+    "multiple_choice": "CTFd Multiple Choice (paid plugin)",
+    "manual_verification": "CTFd Manual Verification (paid plugin)",
+}
 
 
 @dataclass
@@ -122,6 +127,34 @@ def category_config_for(category_name: str) -> Optional[CategoryConfig]:
     return None
 
 
+def _format_ctfd_error(resp: requests.Response) -> str:
+    """Best-effort short message from a CTFd error response."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        text = " ".join((resp.text or "").split())
+        return text[:240] if text else (resp.reason or "")
+    if isinstance(payload, dict):
+        errs = payload.get("errors") or payload.get("message") or payload.get("error")
+        if errs:
+            return str(errs)[:240]
+    return str(payload)[:240]
+
+
+def _challenge_create_error(resp: requests.Response, challenge: "Challenge") -> str:
+    """Explain a failed challenge create, especially missing paid plugins."""
+    detail = _format_ctfd_error(resp)
+    plugin = PLUGIN_TYPE_HELP.get(challenge.challenge_type)
+    if plugin:
+        extra = f" {detail}" if detail else ""
+        return (
+            f"CTFd rejected type={challenge.challenge_type!r} for '{challenge.name}' "
+            f"({resp.status_code}). This needs {plugin}; stock CTFd cannot create it.{extra}"
+        )
+    extra = f": {detail}" if detail else ""
+    return f"CTFd {resp.status_code} creating '{challenge.name}'{extra}"
+
+
 @dataclass
 class Challenge:
     """Represents a CTF challenge."""
@@ -156,6 +189,7 @@ class CTFdClient:
             "Content-Type": "application/json",
         })
         self._challenges_cache: Optional[list] = None  # Avoid re-fetching when admin endpoint returns 500
+        self._solutions_cache: Optional[list] = None
 
     def _api_url(self, endpoint: str) -> str:
         return f"{self.base_url}/api/v1{endpoint}"
@@ -279,9 +313,35 @@ class CTFdClient:
 
     def get_challenge(self, challenge_id: int) -> dict:
         """Get details of a single challenge."""
-        resp = self.session.get(self._api_url(f"/challenges/{challenge_id}"))
+        resp = self.session.get(self._api_url(f"/challenges/{challenge_id}"), timeout=10)
         resp.raise_for_status()
         return resp.json().get("data", {})
+
+    def hydrate_challenge_details(self, challenges: list) -> list:
+        """Fill fields the admin list omits (notably `state` on CTFd 3.8)."""
+        if not challenges:
+            return challenges
+        if all(ch.get("state") for ch in challenges):
+            return challenges
+
+        print(f"Fetching details for {len(challenges)} challenge(s)...")
+        hydrated = []
+        for ch in challenges:
+            cid = ch.get("id")
+            if not cid:
+                hydrated.append(ch)
+                continue
+            try:
+                info = self.get_challenge(cid)
+            except requests.RequestException:
+                hydrated.append(ch)
+                continue
+            merged = dict(ch)
+            for key in ("state", "value", "category", "type", "max_attempts", "name"):
+                if info.get(key) is not None:
+                    merged[key] = info[key]
+            hydrated.append(merged)
+        return hydrated
 
     def challenge_exists(self, name: str) -> Optional[int]:
         """Check if a challenge with this name exists (case-insensitive). Returns challenge_id or None."""
@@ -311,16 +371,27 @@ class CTFdClient:
         resp = self.session.delete(self._api_url(f"/challenges/{challenge_id}"))
         resp.raise_for_status()
 
-    def delete_all_challenges(self, category_filter: Optional[str] = None) -> tuple[int, int]:
-        """Delete challenges in CTFd. If category_filter is given, only delete challenges whose
-        category contains that string (case-insensitive). Otherwise delete every challenge.
-        Returns (deleted_count, error_count)."""
+    def delete_all_challenges(
+        self,
+        category_filter: Optional[str] = None,
+        name_filter: Optional[set[str]] = None,
+    ) -> tuple[int, int]:
+        """Delete challenges in CTFd.
+
+        If name_filter is given, only delete challenges whose names match
+        (case-insensitive). Else if category_filter is given, only delete
+        challenges whose category contains that string. Otherwise delete every
+        challenge. Returns (deleted_count, error_count).
+        """
         self._challenges_cache = None
         challenges = self.get_challenges(use_cache=False)
+        names_l = {n.lower().strip() for n in name_filter} if name_filter is not None else None
         targets = []
         for ch in challenges:
             challenge_id = ch.get("id")
             if not challenge_id:
+                continue
+            if names_l is not None and ch.get("name", "").lower().strip() not in names_l:
                 continue
             if category_filter and category_filter.lower() not in ch.get("category", "").lower():
                 continue
@@ -357,6 +428,16 @@ class CTFdClient:
         resp.raise_for_status()
         return resp.json().get("data", {})
 
+    def get_challenge_requirements(self, challenge_id: int) -> dict:
+        """Admin-only requirements (`GET /challenges/<id>/requirements`)."""
+        resp = self.session.get(
+            self._api_url(f"/challenges/{challenge_id}/requirements"),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data")
+        return data if isinstance(data, dict) else {}
+
     def create_challenge(self, challenge: Challenge) -> dict:
         """Create a new challenge."""
         payload = {
@@ -370,7 +451,8 @@ class CTFdClient:
         if challenge.max_attempts is not None:
             payload["max_attempts"] = challenge.max_attempts
         resp = self.session.post(self._api_url("/challenges"), json=payload)
-        resp.raise_for_status()
+        if not resp.ok:
+            raise RuntimeError(_challenge_create_error(resp, challenge))
         return resp.json().get("data", {})
 
     def create_flag(self, challenge_id: int, flag_content: str, flag_type: str = "static") -> dict:
@@ -442,6 +524,7 @@ class CTFdClient:
         }
         resp = self.session.post(self._api_url("/solutions"), json=payload)
         resp.raise_for_status()
+        self._solutions_cache = None
         return resp.json().get("data", {})
 
     def create_tag(self, challenge_id: int, value: str) -> dict:
@@ -473,6 +556,68 @@ class CTFdClient:
                 data=data
             )
         resp.raise_for_status()
+        return resp.json().get("data", {})
+
+    def get_flags(self, challenge_id: int) -> list[dict]:
+        """List flags for a challenge (admin API)."""
+        resp = self.session.get(
+            self._api_url("/flags"),
+            params={"challenge_id": challenge_id},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        flags = resp.json().get("data", []) or []
+        return [f for f in flags if f.get("challenge_id") == challenge_id]
+
+    def delete_flag(self, flag_id: int) -> None:
+        resp = self.session.delete(self._api_url(f"/flags/{flag_id}"), timeout=10)
+        resp.raise_for_status()
+
+    def get_hint(self, hint_id: int, preview: bool = True) -> dict:
+        """Read a hint. `preview=true` is required to see locked hint content."""
+        params = {"preview": "true"} if preview else None
+        resp = self.session.get(
+            self._api_url(f"/hints/{hint_id}"),
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {})
+
+    def delete_hint(self, hint_id: int) -> None:
+        resp = self.session.delete(self._api_url(f"/hints/{hint_id}"), timeout=10)
+        resp.raise_for_status()
+
+    def get_challenge_files(self, challenge_id: int) -> list[dict]:
+        resp = self.session.get(
+            self._api_url(f"/challenges/{challenge_id}/files"),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", []) or []
+
+    def delete_file(self, file_id: int) -> None:
+        resp = self.session.delete(self._api_url(f"/files/{file_id}"), timeout=10)
+        resp.raise_for_status()
+
+    def get_solutions(self, challenge_id: Optional[int] = None) -> list[dict]:
+        """List solutions. CTFd may ignore challenge_id; filter client-side."""
+        if self._solutions_cache is None:
+            resp = self.session.get(self._api_url("/solutions"), timeout=10)
+            resp.raise_for_status()
+            self._solutions_cache = resp.json().get("data", []) or []
+        if challenge_id is None:
+            return self._solutions_cache
+        return [s for s in self._solutions_cache if s.get("challenge_id") == challenge_id]
+
+    def update_solution(self, solution_id: int, content: str) -> dict:
+        resp = self.session.patch(
+            self._api_url(f"/solutions/{solution_id}"),
+            json={"content": content},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        self._solutions_cache = None
         return resp.json().get("data", {})
 
     def upload_challenge(self, challenge: Challenge, skip_existing: bool = True, update_existing: bool = False) -> tuple[Optional[int], str]:
@@ -547,17 +692,18 @@ class CTFdClient:
 
     def _update_existing_challenge(self, challenge_id: int, challenge: Challenge) -> tuple[int, str]:
         """
-        Compare existing challenge with new data and update if different.
+        Compare existing challenge with markdown and update fields, flags, hints, files, and solution.
         Returns (challenge_id, action) where action is 'updated' or 'unchanged'.
+        Does not change visibility (`state`) — hide/unhide is a separate command.
         """
         existing = self.get_challenge(challenge_id)
+        changed: list[str] = []
 
         updates = {}
         fields_to_check = [
             ("description", "description"),
             ("category", "category"),
             ("value", "value"),
-            ("state", "state"),
             ("type", "challenge_type"),
             ("max_attempts", "max_attempts"),
         ]
@@ -570,14 +716,116 @@ class CTFdClient:
             if new_value != old_value:
                 updates[api_field] = new_value
 
-        if not updates:
+        if updates:
+            self.update_challenge_fields(challenge_id, updates)
+            changed.extend(updates.keys())
+
+        if self._sync_flags(challenge_id, challenge):
+            changed.append("flag")
+        if self._sync_hints(challenge_id, challenge):
+            changed.append("hints")
+        if self._sync_files(challenge_id, challenge):
+            changed.append("files")
+        if self._sync_solution(challenge_id, challenge):
+            changed.append("solution")
+
+        if not changed:
             print(f"  [UNCHANGED] Challenge '{challenge.name}' (id={challenge_id}) - no changes detected")
             return (challenge_id, "unchanged")
 
-        self.update_challenge_fields(challenge_id, updates)
-        changed_fields = ", ".join(updates.keys())
-        print(f"  [UPDATE] Challenge '{challenge.name}' (id={challenge_id}) - updated: {changed_fields}")
+        print(
+            f"  [UPDATE] Challenge '{challenge.name}' (id={challenge_id}) - updated: {', '.join(changed)}"
+        )
         return (challenge_id, "updated")
+
+    def _sync_flags(self, challenge_id: int, challenge: Challenge) -> bool:
+        """Make CTFd flags match markdown. Skip when markdown has no flag (manual)."""
+        if not challenge.flag:
+            return False
+        existing = self.get_flags(challenge_id)
+        if (
+            len(existing) == 1
+            and (existing[0].get("content") or "") == challenge.flag
+            and (existing[0].get("type") or "static") == challenge.flag_type
+        ):
+            return False
+        for flag in existing:
+            self.delete_flag(flag["id"])
+        self.create_flag(challenge_id, challenge.flag, challenge.flag_type)
+        return True
+
+    def _sync_hints(self, challenge_id: int, challenge: Challenge) -> bool:
+        """Replace hints when content, count, cost, or unlock order differs."""
+        existing = sorted(self.get_hints(challenge_id), key=lambda h: h.get("id", 0))
+        desired_costs = compute_hint_costs(challenge.value, len(challenge.hints))
+        current_contents: list[str] = []
+        current_costs = [h.get("cost", 0) for h in existing]
+        for hint in existing:
+            detail = self.get_hint(hint["id"], preview=True)
+            current_contents.append((detail.get("content") or "").strip())
+
+        desired_contents = [h.strip() for h in challenge.hints]
+        if current_contents == desired_contents and current_costs == desired_costs:
+            return False
+
+        for hint in reversed(existing):
+            self.delete_hint(hint["id"])
+        created_hint_ids: list[int] = []
+        for text, cost in zip(challenge.hints, desired_costs):
+            hint_data = self.create_hint(
+                challenge_id,
+                text,
+                cost=cost,
+                prerequisite_ids=created_hint_ids.copy(),
+            )
+            created_hint_ids.append(hint_data["id"])
+        return True
+
+    def _sync_files(self, challenge_id: int, challenge: Challenge) -> bool:
+        """Upload new/changed attachments and remove files no longer in markdown."""
+        existing = self.get_challenge_files(challenge_id)
+        existing_by_name: dict[str, dict] = {}
+        for info in existing:
+            name = str(info.get("location") or "").replace("\\", "/").rsplit("/", 1)[-1]
+            if name:
+                existing_by_name[name] = info
+
+        desired_by_name = {path.name: path for path in challenge.files}
+        changed = False
+
+        for name, info in list(existing_by_name.items()):
+            if name not in desired_by_name:
+                self.delete_file(info["id"])
+                changed = True
+                existing_by_name.pop(name, None)
+
+        for name, path in desired_by_name.items():
+            current = existing_by_name.get(name)
+            local_hash = _sha1_file(path)
+            if current and current.get("sha1sum") == local_hash:
+                continue
+            if current:
+                self.delete_file(current["id"])
+            self.upload_file(challenge_id, path)
+            changed = True
+        return changed
+
+    def _sync_solution(self, challenge_id: int, challenge: Challenge) -> bool:
+        """Create or patch the admin solution when markdown has one."""
+        if not challenge.solution:
+            return False
+        existing = self.get_solutions(challenge_id)
+        if existing:
+            current = existing[0]
+            if (current.get("content") or "") == challenge.solution:
+                return False
+            self.update_solution(current["id"], challenge.solution)
+            return True
+        try:
+            self.create_solution(challenge_id, challenge.solution)
+            return True
+        except requests.HTTPError:
+            return False
 
 
 def _category_root_for(file_path: Path, base_path: Path) -> Path:
@@ -590,6 +838,14 @@ def _category_root_for(file_path: Path, base_path: Path) -> Path:
         except ValueError:
             continue
     return file_path.parent
+
+
+def _sha1_file(path: Path) -> str:
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_attachment_path(
@@ -1180,6 +1436,66 @@ def discover_challenges(base_path: Path) -> dict[str, list[Path]]:
     return discoveries
 
 
+def resolve_sync_file(
+    file_arg: str, discoveries: dict[str, list[Path]], base_path: Path
+) -> tuple[str, Path]:
+    """Resolve --file to one discovered (category, path)."""
+    raw = Path(file_arg)
+    all_files = [(cat, f) for cat, files in discoveries.items() for f in files]
+    if not all_files:
+        raise FileNotFoundError(
+            f"No challenge files discovered under {base_path}; cannot match --file {file_arg}"
+        )
+
+    wanted: Optional[Path] = None
+    for candidate in (raw, Path.cwd() / raw, base_path / raw):
+        try:
+            if candidate.is_file():
+                wanted = candidate.resolve()
+                break
+        except OSError:
+            continue
+
+    if wanted is not None:
+        for cat, f in all_files:
+            try:
+                if f.resolve() == wanted:
+                    return cat, f
+            except OSError:
+                continue
+        raise FileNotFoundError(
+            f"{wanted} exists but is not a discovered challenge file under {base_path}"
+        )
+
+    needle = raw.as_posix().replace("\\", "/").lower()
+    matches: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for cat, f in all_files:
+        rel = str(f.relative_to(base_path)).replace("\\", "/").lower() if f.is_relative_to(base_path) else f.as_posix().replace("\\", "/").lower()
+        if rel == needle or rel.endswith("/" + needle) or f.name.lower() == raw.name.lower():
+            key = str(f.resolve())
+            if key not in seen:
+                seen.add(key)
+                matches.append((cat, f))
+
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"No discovered challenge file matches --file {file_arg}")
+    listing = "\n".join(f"  [{cat}] {f}" for cat, f in matches)
+    raise ValueError(f"--file {file_arg} matches multiple challenges:\n{listing}")
+
+
+def _warn_multiple_intros(category: str, items: list[tuple[Path, Challenge, bool]]) -> None:
+    intro_names = [ch.name for _, ch, is_intro in items if is_intro]
+    if len(intro_names) > 1:
+        extras = ", ".join(repr(n) for n in intro_names[1:])
+        print(
+            f"  [WARN] {len(intro_names)} intro files in '{category}'. "
+            f"Gating on '{intro_names[0]}'; extra intro(s) not used as the gate: {extras}"
+        )
+
+
 def prepare_category_items(
     category: str, files: list[Path], base_path: Path
 ) -> list[tuple[Path, Challenge, bool]]:
@@ -1265,6 +1581,7 @@ def run_sync(args) -> int:
 
             print(f"\n[{category}]")
             items = prepare_category_items(category, files, base_path)
+            _warn_multiple_intros(category, items)
             for file_path, ch, _ in items:
                 if ch.challenge_type == "manual_verification":
                     print(f"  {ch.name}: {ch.value} pts, [MANUAL], {len(ch.hints)} hints")
@@ -1290,6 +1607,25 @@ def run_sync(args) -> int:
         print("[!] Specify --all, --category, or --file to upload challenges")
         return 1
 
+    if do_file:
+        try:
+            file_cat, file_path = resolve_sync_file(do_file, discoveries, base_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[ERROR] {e}")
+            return 1
+        if category_filter and category_filter.lower() not in file_cat.lower():
+            print(
+                f"[ERROR] --file is in category {file_cat!r}, "
+                f"which does not match --category {category_filter!r}"
+            )
+            return 1
+        try:
+            rel = file_path.relative_to(base_path)
+        except ValueError:
+            rel = file_path
+        print(f"[FILE] Limiting upload to {rel} ({file_cat})")
+        discoveries = {file_cat: [file_path]}
+
     # Validate credentials
     if not CTFD_TOKEN:
         print("[ERROR] CTFD_TOKEN not set. Create a .env file with your API token.")
@@ -1305,7 +1641,22 @@ def run_sync(args) -> int:
 
     if getattr(args, "fresh", False):
         existing = client.get_challenges(use_cache=False)
-        if category_filter:
+        name_filter: Optional[set[str]] = None
+        if do_file:
+            names: set[str] = set()
+            for category, files in discoveries.items():
+                if category_filter and category_filter.lower() not in category.lower():
+                    continue
+                for _, ch, _ in prepare_category_items(category, files, base_path):
+                    names.add(ch.name)
+            name_filter = names
+            names_l = {n.lower().strip() for n in names}
+            targets = [
+                c for c in existing if c.get("name", "").lower().strip() in names_l
+            ]
+            scope_label = f"{len(targets)} matching --file challenge(s)"
+            confirm_phrase = "DELETE"
+        elif category_filter:
             targets = [c for c in existing if category_filter.lower() in c.get("category", "").lower()]
             scope_label = f"category matching '{category_filter}'"
             confirm_phrase = "DELETE"
@@ -1321,7 +1672,10 @@ def run_sync(args) -> int:
                     print("Aborted.")
                     return 1
             print(f"[MODE] Fresh upload - deleting existing challenges ({scope_label})...\n")
-            deleted, delete_errors = client.delete_all_challenges(category_filter=category_filter)
+            deleted, delete_errors = client.delete_all_challenges(
+                category_filter=None if do_file else category_filter,
+                name_filter=name_filter,
+            )
             print(f"\n[WIPE] Deleted: {deleted}, Errors: {delete_errors}\n")
             if delete_errors:
                 print("[WARN] Some challenges failed to delete. Continuing with upload.\n")
@@ -1356,6 +1710,7 @@ def run_sync(args) -> int:
         other_challenge_ids = []
 
         items = prepare_category_items(category, files, base_path)
+        _warn_multiple_intros(category, items)
         for file_path, challenge, is_intro in items:
             print(f"\nProcessing: {file_path.name} -> {challenge.name}")
 
@@ -1376,8 +1731,14 @@ def run_sync(args) -> int:
 
                 if result_id and getattr(args, "add_requirements", False):
                     if is_intro:
-                        intro_challenge_id = result_id
-                        intro_challenge_name = challenge.name
+                        if intro_challenge_id is None:
+                            intro_challenge_id = result_id
+                            intro_challenge_name = challenge.name
+                        else:
+                            print(
+                                f"  [WARN] Extra intro '{challenge.name}' "
+                                f"is not used as the gate"
+                            )
                     else:
                         other_challenge_ids.append(result_id)
 
@@ -1392,7 +1753,15 @@ def run_sync(args) -> int:
             for cid in other_challenge_ids:
                 try:
                     client.set_challenge_requirements(cid, [intro_challenge_id])
-                    print(f"    + Challenge {cid} now requires intro")
+                    stored = client.get_challenge_requirements(cid)
+                    prereqs = stored.get("prerequisites") or []
+                    if list(prereqs) != [intro_challenge_id]:
+                        print(
+                            f"    ! Challenge {cid} requirements not confirmed "
+                            f"(API returned {prereqs!r})"
+                        )
+                    else:
+                        print(f"    + Challenge {cid} now requires intro")
                 except Exception as e:
                     print(f"    ! Failed to set requirements for {cid}: {e}")
 
@@ -1427,13 +1796,13 @@ Examples:
     parser.add_argument("--list", action="store_true", help="List discovered challenges")
     parser.add_argument("--all", action="store_true", help="Upload all challenges")
     parser.add_argument("--category", type=str, help="Filter by category (partial match)")
-    parser.add_argument("--file", type=str, help="Upload a single file")
+    parser.add_argument("--file", type=str, help="Upload a single markdown file")
     parser.add_argument("--update", action="store_true",
-                        help="Update existing challenges if values changed (points, description, etc.)")
+                        help="Update existing challenges (fields, flags, hints, files, solutions)")
     parser.add_argument("--add-requirements", action="store_true",
                         help="Set intro (0) questions as prerequisites for other challenges in same category")
     parser.add_argument("--fresh", action="store_true",
-                        help="Delete all existing CTFd challenges before uploading")
+                        help="Delete matching CTFd challenges before upload (--all / --category / --file scope)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Skip confirmation prompts (use with --fresh)")
     parser.add_argument("--probe-fallback", action="store_true",

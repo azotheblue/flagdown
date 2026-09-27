@@ -100,7 +100,7 @@ def dry_run_cmd(content_path, config, category):
 @_content_options
 @click.option("--all", "sync_all", is_flag=True, help="Upload all categories")
 @click.option("--file", "file_path", default=None, help="Upload a single markdown file")
-@click.option("--update", is_flag=True, help="Update existing challenges when values change")
+@click.option("--update", is_flag=True, help="Update existing challenges (fields, flags, hints, files, solutions)")
 @click.option(
     "--add-requirements",
     is_flag=True,
@@ -168,7 +168,7 @@ def status_cmd(probe_fallback):
         raise SystemExit(1)
 
     click.echo("Fetching challenges...")
-    challenges = client.get_challenges(use_cache=False)
+    challenges = client.hydrate_challenge_details(client.get_challenges(use_cache=False))
 
     by_category = Counter(ch.get("category", "Uncategorized") for ch in challenges)
     by_type = Counter(ch.get("type", "unknown") for ch in challenges)
@@ -206,7 +206,7 @@ def hide_cmd(category, yes):
     if not client.test_connection():
         raise SystemExit(1)
 
-    challenges = client.get_challenges(use_cache=False)
+    challenges = client.hydrate_challenge_details(client.get_challenges(use_cache=False))
     if category:
         challenges = [
             c for c in challenges if category.lower() in (c.get("category") or "").lower()

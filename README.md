@@ -1,7 +1,7 @@
 # Flagdown
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![version](https://img.shields.io/badge/version-0.1.0-green.svg)](pyproject.toml)
+[![version](https://img.shields.io/badge/version-0.2.0-green.svg)](pyproject.toml)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/azotheblue/flagdown/pulls)
 [![GitHub stars](https://img.shields.io/github/stars/azotheblue/flagdown?style=social)](https://github.com/azotheblue/flagdown)
 
@@ -37,9 +37,12 @@ cp categories.example.yaml categories.yaml
 ## CLI
 
 ```bash
+flagdown list --path examples
+flagdown dry-run --path examples
 flagdown list --path /path/to/content
 flagdown dry-run --path /path/to/content
 flagdown sync --path /path/to/content --all
+flagdown sync --path /path/to/content --file 02-web/questions/01-xss.md
 flagdown sync --path /path/to/content --category linux --update
 flagdown sync --path /path/to/content --all --add-requirements
 flagdown sync --path /path/to/content --all --fresh --yes
@@ -62,6 +65,10 @@ flagdown ui sort-by-name
 | `hide` / `delete` | Bulk visibility / wipe |
 | `fix-hints` | Sequential hint unlock + costs on live instance |
 | `ui …` | Paste-ready Theme / Settings snippets |
+
+## Agent skill
+
+Cursor (and other agents that load `SKILL.md`): [`.cursor/skills/flagdown/SKILL.md`](.cursor/skills/flagdown/SKILL.md). Copy that folder into a course-content repo if agents should author or sync challenges there.
 
 ## Why not ctfcli / Terraform?
 
@@ -144,7 +151,7 @@ answer_here
 
 Multiple choice and manual verification require [CTFd's paid challenge plugins](https://ctfd.io/). Flagdown can author them; uploads fail without the plugins.
 
-See `examples/` (plugin examples are marked `.REQUIRES-PLUGIN`).
+See `examples/` for a runnable mini course (`flagdown list --path examples`). Plugin examples are marked `.REQUIRES-PLUGIN`.
 
 ## Extras
 
